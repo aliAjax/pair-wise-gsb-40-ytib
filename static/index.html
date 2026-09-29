@@ -1,8 +1,227 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
-<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
-<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
-<h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>海上搜救协调 — 海况修订</title>
+<style>
+  body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:30px auto;padding:0 20px;color:#17324d}
+  h1{margin-bottom:4px} h2{margin-top:32px;border-bottom:2px solid #d7e6f2;padding-bottom:6px}
+  table{border-collapse:collapse;width:100%;margin:14px 0}
+  th,td{border:1px solid #cbd8e3;padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#edf5fb}
+  code{background:#f2f5f7;padding:1px 5px;border-radius:3px}
+  .card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px;margin:14px 0}
+  .warn{background:#fff7ec;border-left:5px solid #e0a13c;padding:12px 16px;margin:14px 0}
+  .gap{background:#fdecec;border-left:5px solid #d06060;padding:12px 16px;margin:14px 0}
+  form{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;align-items:end;margin:12px 0}
+  label{font-size:13px;color:#5a7186;display:block}
+  input,select{padding:6px 8px;border:1px solid #b9c9d6;border-radius:4px;width:100%;box-sizing:border-box;font:inherit}
+  button{padding:7px 14px;border:none;border-radius:4px;background:#2784c7;color:#fff;cursor:pointer;font:inherit}
+  button.sec{background:#6b8299} button.danger{background:#c0504d} button:disabled{background:#b9c6d2;cursor:not-allowed}
+  .pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-right:4px}
+  .pill.pending{background:#fff0d6;color:#9a6a1c} .pill.applied{background:#d8f0d8;color:#2c6b2c}
+  .pill.gap{background:#fbdada;color:#a03030} .pill.reassigned{background:#d6e8f8;color:#1f5c8a}
+  .pill.reassigning{background:#fdf0c8;color:#8a6d1a} .pill.handed_over{background:#d8f0d8;color:#2c6b2c}
+  .muted{color:#6b8299;font-size:13px}
+  #msg{margin:10px 0;padding:9px 12px;border-radius:4px;display:none}
+  #msg.err{background:#fdecec;color:#a03030;display:block} #msg.ok{background:#d8f0d8;color:#2c6b2c;display:block}
+  .rev-row{cursor:pointer} .rev-row:hover{background:#f2f8fd}
+</style>
+<h1>海上搜救协调</h1>
+<div class="card">
+  页面读取实时状态。写操作通过 JSON API 完成，需要 <code>X-User</code>、<code>X-Role</code> 请求头
+  （本页默认 <code>coord-demo</code> / <code>coordinator</code>）。
+</div>
+<div id="msg"></div>
+
+<h2>海况修订</h2>
+<div class="card">
+  <strong>登记新海况、漂移参数与生效时刻</strong>（先看受影响区域，再确认应用）：
+  <form id="rev-form">
+    <div><label>事件</label><select id="rev-incident"></select></div>
+    <div><label>海况等级 (0-9)</label><input id="rev-sea" type="number" min="0" max="9" value="6"></div>
+    <div><label>漂移方向 (度, 0-360)</label><input id="rev-dir" type="number" min="0" max="359" value="90"></div>
+    <div><label>漂移速度 (节)</label><input id="rev-speed" type="number" min="0" step="0.1" value="2"></div>
+    <div><label>生效时刻</label><input id="rev-effective" type="datetime-local"></div>
+    <div><button type="submit">登记修订</button></div>
+  </form>
+</div>
+
+<h3>历次修订</h3>
+<div class="muted">点击一行查看该修订的受影响区域、原船 / 接手船 / 缺口，并确认应用。</div>
+<table id="revisions">
+  <thead><tr><th>ID</th><th>事件</th><th>海况</th><th>漂移</th><th>生效时刻</th><th>状态</th><th>版本</th><th>登记人</th><th>操作</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<div id="impact"></div>
+
+<h2>遇险事件</h2>
+<table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
+<h2>资源</h2>
+<table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th><th>适用海况</th></tr></thead><tbody></tbody></table>
+<h2>搜索区域</h2>
+<table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th><th>中心</th></tr></thead><tbody></tbody></table>
+<h2>时间线</h2>
+<ol id="timeline"></ol>
+
+<script>
+const HEADERS = {'Content-Type':'application/json','X-User':'coord-demo','X-Role':'coordinator'};
+const $ = id => document.getElementById(id);
+let STATE = {incidents:[], assets:[], search_areas:[]};
+
+function showMsg(text, ok){const m=$('msg');m.textContent=text;m.className=ok?'ok':'err';}
+async function api(path, opts){
+  const r = await fetch(path, {headers:HEADERS, ...opts});
+  const body = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(body.error || ('HTTP '+r.status));
+  return body;
+}
+const fmt = v => v==null ? '' : v;
+const pill = s => `<span class="pill ${s}">${s}</span>`;
+const incidentCode = id => { const i=STATE.incidents.find(x=>x.id===id); return i?i.code:id; };
+const assetName = id => { const a=STATE.assets.find(x=>x.id===id); return a?a.name:''; };
+
+async function load(){
+  STATE = await api('/api/state');
+  const fill=(id,rows,cols)=>{$(id).querySelector('tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${fmt(r[c])}</td>`).join('')+'</tr>').join('')};
+  fill('incidents',STATE.incidents,['code','vessel_name','status','sea_state','lead_org','version']);
+  fill('assets',STATE.assets,['name','kind','status','range_km','max_sea_state']);
+  fill('areas',STATE.search_areas,['code','incident_id','status','priority','assigned_asset_id','center_lat']);
+  $('timeline').innerHTML = STATE.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('');
+  const sel = $('rev-incident');
+  sel.innerHTML = STATE.incidents.filter(i=>!['closed','cancelled','duplicate'].includes(i.status))
+    .map(i=>`<option value="${i.id}">${i.code} ${i.vessel_name}</option>`).join('');
+  await loadRevisions();
+}
+
+async function loadRevisions(){
+  const rows = [];
+  for(const i of STATE.incidents){
+    const r = await api(`/api/incidents/${i.id}/sea-revisions`);
+    for(const rev of r.revisions) rows.push(rev);
+  }
+  rows.sort((a,b)=>b.id-a.id);
+  $('revisions').querySelector('tbody').innerHTML = rows.map(rev=>`
+    <tr class="rev-row" onclick="showImpact(${rev.id})">
+      <td>${rev.id}</td><td>${incidentCode(rev.incident_id)}</td>
+      <td>${rev.sea_state}</td>
+      <td>${rev.drift_direction}°/${rev.drift_speed_kn}kn</td>
+      <td>${rev.effective_at}</td>
+      <td>${pill(rev.status)}</td><td>${rev.version}</td><td>${rev.created_by}</td>
+      <td><button class="sec" onclick="event.stopPropagation();showImpact(${rev.id})">查看影响</button></td>`).join('')
+    || '<tr><td colspan="9" class="muted">暂无修订</td></tr>';
+}
+
+$('rev-form').addEventListener('submit', async e=>{
+  e.preventDefault();
+  const effective = $('rev-effective').value;
+  if(!effective){ showMsg('请选择生效时刻'); return; }
+  try{
+    const rev = await api('/api/sea-revisions', {method:'POST', body:JSON.stringify({
+      incident_id: Number($('rev-incident').value),
+      sea_state: Number($('rev-sea').value),
+      drift_direction: Number($('rev-dir').value),
+      drift_speed_kn: Number($('rev-speed').value),
+      effective_at: effective.length===16 ? effective+':00' : effective
+    })});
+    showMsg(`已登记修订 #${rev.id}（待应用），可查看受影响区域`, true);
+    await loadRevisions();
+    showImpact(rev.id);
+  }catch(err){ showMsg('登记失败：'+err.message); }
+});
+
+async function showImpact(revId){
+  try{
+    const data = await api(`/api/sea-revisions/${revId}`);
+    const {revision:rev, incident, affected, unaffected, summary} = data;
+    const canApply = rev.status==='pending';
+    let body = '';
+    if(canApply){
+      const rows = affected.map(x=>{
+        const a=x.area;
+        const repl = x.replacement_asset;
+        return `<tr>
+          <td>${a.code}</td>
+          <td>${assetName(x.original_asset?x.original_asset.id:null)}</td>
+          <td>${x.reasons.map(pill).join(' ')}</td>
+          <td>${x.new_center[0].toFixed(2)}, ${x.new_center[1].toFixed(2)}</td>
+          <td>${repl?assetName(repl.id):'<span class="pill gap">缺口</span>'}</td>
+          <td>${pill(x.disposition)}</td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="6" class="muted">无受影响区域</td></tr>';
+      body = `
+        <div class="${summary.gaps?'gap':'warn'}">
+          受影响 <strong>${summary.affected}</strong> 个：
+          未出动重排 <strong>${summary.reassigned}</strong>，已出动待接手 <strong>${summary.reassigning}</strong>，
+          缺口 <strong>${summary.gaps}</strong>；仅漂移更新中心 <strong>${summary.repositioned||0}</strong>。
+          ${summary.gaps?'<br>存在缺口：找不到接手船的区域将留下缺口，原船在接手确认前仍负责。':''}
+        </div>
+        <table><thead><tr><th>区域</th><th>原船</th><th>原因</th><th>漂移后中心</th><th>接手船</th><th>处置</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+        <div class="muted">未受影响区域 ${unaffected.length} 个。</div>
+        <p><button onclick="applyRevision(${rev.id}, ${incident.version})">确认应用修订 #${rev.id}</button>
+          <span class="muted">携带事件版本 ${incident.version}；若已被其他协调员改动将返回版本冲突。</span></p>`;
+    } else {
+      const ad = await api(`/api/sea-revisions/${revId}/assignments`);
+      const rows = ad.assignments.map(a=>{
+        const area = STATE.search_areas.find(x=>x.id===a.area_id);
+        const replCell = a.replacement_asset_id==null
+          ? '<span class="pill gap">缺口</span>'
+          : assetName(a.replacement_asset_id);
+        const action = a.status==='reassigning'
+          ? `<button onclick="confirmHandover(${a.id})">接手确认</button>` : '';
+        return `<tr>
+          <td>${area?area.code:a.area_id}</td>
+          <td>${assetName(a.original_asset_id)}</td>
+          <td>${replCell}</td>
+          <td>${(a.reason||'').split(',').filter(Boolean).map(pill).join(' ')}</td>
+          <td>${pill(a.status)}</td>
+          <td>${a.confirmed_by?a.confirmed_by+' / '+a.confirmed_at:''}</td>
+          <td>${action}</td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="7" class="muted">无改派记录</td></tr>';
+      const s = JSON.parse(rev.impact_summary||'{}');
+      body = `
+        <div class="${s.gaps?'gap':'card'}">
+          应用结果：受影响 <strong>${s.affected??0}</strong>，未出动重排 <strong>${s.reassigned??0}</strong>，
+          已出动待接手 <strong>${s.reassigning??0}</strong>，缺口 <strong>${s.gaps??0}</strong>，
+          仅漂移更新中心 <strong>${s.repositioned??0}</strong>。
+          ${s.gaps?'<br>存在缺口：找不到接手船的区域已留下缺口。':''}
+        </div>
+        <h3>历次改派记录（原船 / 接手船 / 缺口）</h3>
+        <table><thead><tr><th>区域</th><th>原船</th><th>接手船 / 缺口</th><th>原因</th><th>状态</th><th>接手确认</th><th>操作</th></tr></thead>
+        <tbody>${rows}</tbody></table>`;
+    }
+    $('impact').innerHTML = `
+      <div class="card">
+        <strong>修订 #${rev.id}</strong>（${incident.code}）海况 ${rev.sea_state}，
+        漂移 ${rev.drift_direction}°/${rev.drift_speed_kn}kn，生效 ${rev.effective_at}，
+        状态 ${pill(rev.status)}，事件版本 ${incident.version}，登记人 ${rev.created_by}
+      </div>${body}`;
+  }catch(err){ showMsg('加载影响失败：'+err.message); }
+}
+
+async function applyRevision(revId, expectedVersion){
+  try{
+    const res = await api(`/api/sea-revisions/${revId}/apply`, {method:'POST', body:JSON.stringify({expected_version: expectedVersion})});
+    if(res.idempotent){ showMsg(`修订 #${revId} 已应用过，返回完整结果（幂等）`, true); }
+    else { showMsg(`修订 #${revId} 已应用：受影响 ${res.summary.affected}，缺口 ${res.summary.gaps}`, true); }
+    await load();
+    showImpact(revId);
+  }catch(err){ showMsg('应用失败：'+err.message+'（请刷新后重试，后到的提交会看到版本冲突）'); }
+}
+
+async function confirmHandover(assignmentId){
+  try{
+    await api(`/api/revision-assignments/${assignmentId}/confirm`, {method:'POST', body:JSON.stringify({})});
+    showMsg('接手确认完成，原船已解除责任', true);
+    const revId = $('impact').querySelector('strong')?.textContent.match(/\d+/)?.[0];
+    await load();
+    if(revId) showImpact(Number(revId));
+  }catch(err){ showMsg('接手确认失败：'+err.message); }
+}
+
+load().catch(err=>showMsg('加载失败：'+err.message));
+</script>
+</html>

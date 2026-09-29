@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -12,10 +11,28 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from revision_judgment import (
+    area_drift_center,
+    evaluate_area,
+    haversine_km,
+    pick_replacement,
+)
+from revision_store import init_schema as init_revision_schema
+from revision_store import (
+    create_revision,
+    get_assignment,
+    get_revision,
+    insert_assignment,
+    list_assignments,
+    list_revisions,
+)
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "maritime_sar.db"
 ACTIVE_INCIDENT = {"reported", "coordinating", "recovering"}
 CLOSED_INCIDENT = {"closed", "cancelled", "duplicate"}
+# 区域状态：planned 未分配 / assigned 未出动 / active 已出动 / gap 缺口 / completed,abandoned 已结束
+OPEN_AREA = {"planned", "assigned", "active", "gap"}
 
 
 class DomainError(Exception):
@@ -26,15 +43,6 @@ class DomainError(Exception):
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius = 6371.0088
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * radius * math.asin(math.sqrt(a))
 
 
 def require_role(role: str, allowed: set[str], action: str) -> None:
@@ -165,6 +173,7 @@ class MaritimeSARService:
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
                 """
             )
+            init_revision_schema(conn)
 
     def _audit(self, conn: sqlite3.Connection, incident_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -479,6 +488,374 @@ class MaritimeSARService:
             self._audit(conn, incident_id, actor, "incident.closed", {"outcome": outcome})
             return dict(conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone())
 
+    def activate_area(self, actor: str, role: str, area_id: int,
+                      expected_version: int | None = None) -> dict[str, Any]:
+        """出动：已分配未出动（assigned）转为已出动（active），资源仍由该任务占用。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "出动搜索任务")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+            if not area:
+                raise DomainError("搜索区域不存在", 404)
+            if area["status"] != "assigned" or area["assigned_asset_id"] is None:
+                raise DomainError("只有已分配未出动的区域可以出动", 409)
+            if expected_version is not None and area["version"] != int(expected_version):
+                raise DomainError("搜索区域已变化，请刷新后重试", 409)
+            conn.execute(
+                "UPDATE search_areas SET status='active',version=version+1,updated_at=? WHERE id=?",
+                (utcnow(), area_id),
+            )
+            self._audit(conn, area["incident_id"], actor, "area.activated", {"area_id": area_id})
+            return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
+
+    def register_sea_revision(self, actor: str, role: str, incident_id: int, sea_state: int,
+                              drift_direction: float, drift_speed_kn: float,
+                              effective_at: str) -> dict[str, Any]:
+        """协调员登记新海况、漂移参数与生效时刻，生成待应用修订。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "登记海况修订")
+        try:
+            incident_id = int(incident_id)
+            sea_state = int(sea_state)
+            drift_direction = float(drift_direction)
+            drift_speed_kn = float(drift_speed_kn)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("事件、海况和漂移参数必须是数值") from exc
+        if not 0 <= sea_state <= 9:
+            raise DomainError("海况等级应在 0 到 9 之间")
+        if not 0 <= drift_direction < 360:
+            raise DomainError("漂移方向应在 0 到 360 之间")
+        if drift_speed_kn < 0:
+            raise DomainError("漂移速度不能为负")
+        effective_at = str(effective_at).strip()
+        if not effective_at:
+            raise DomainError("生效时刻不能为空")
+        try:
+            datetime.fromisoformat(effective_at)
+        except ValueError as exc:
+            raise DomainError("生效时刻格式无效") from exc
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            if not incident:
+                raise DomainError("事件不存在", 404)
+            if incident["status"] not in ACTIVE_INCIDENT:
+                raise DomainError("当前事件不能登记海况修订", 409)
+            revision = create_revision(
+                conn, incident_id=incident_id, sea_state=sea_state, drift_direction=drift_direction,
+                drift_speed_kn=drift_speed_kn, effective_at=effective_at, actor=actor, now=utcnow(),
+            )
+            self._audit(conn, incident_id, actor, "sea_revision.registered",
+                        {"revision_id": revision["id"], "sea_state": sea_state,
+                         "drift_direction": drift_direction, "drift_speed_kn": drift_speed_kn,
+                         "effective_at": effective_at})
+            return revision
+
+    def _load_revision_context(self, conn, revision_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        revision = get_revision(conn, revision_id)
+        if not revision:
+            raise DomainError("海况修订不存在", 404)
+        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (revision["incident_id"],)).fetchone()
+        if not incident:
+            raise DomainError("事件不存在", 404)
+        return revision, dict(incident)
+
+    def _plan_revision(self, conn, revision: dict[str, Any], incident: dict[str, Any]) -> dict[str, Any]:
+        """试算修订影响：哪些区域受影响、原船、接手船或缺口。不落库。"""
+        areas = [dict(r) for r in conn.execute(
+            "SELECT * FROM search_areas WHERE incident_id=? AND status IN ('planned','assigned','active','gap') ORDER BY priority,id",
+            (incident["id"],),
+        ).fetchall()]
+        sim_assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
+        affected: list[dict[str, Any]] = []
+        unaffected: list[dict[str, Any]] = []
+        summary = {"affected": 0, "reassigned": 0, "reassigning": 0, "gaps": 0, "unaffected": 0}
+        for area in areas:
+            original = next((a for a in sim_assets if a["id"] == area["assigned_asset_id"]), None) if area["assigned_asset_id"] else None
+            if original is None:
+                unaffected.append(area)
+                summary["unaffected"] += 1
+                continue
+            impact = evaluate_area(area, original, revision["sea_state"], revision["drift_direction"],
+                                   revision["drift_speed_kn"], revision["effective_at"])
+            if not impact["affected"]:
+                unaffected.append(area)
+                summary["unaffected"] += 1
+                continue
+            summary["affected"] += 1
+            new_lat, new_lon = impact["new_center"]
+            if area["status"] == "assigned":
+                # 未出动：释放后重排，原船先回到可用池参与匹配
+                for asset in sim_assets:
+                    if asset["id"] == original["id"]:
+                        asset["status"] = "available"
+                replacement = pick_replacement(sim_assets, area["kind"], revision["sea_state"],
+                                               impact["new_center"], exclude_asset_ids=set())
+                disposition = "reassigned" if replacement else "gap"
+                if replacement:
+                    for asset in sim_assets:
+                        if asset["id"] == replacement["id"]:
+                            asset["status"] = "assigned"
+                    summary["reassigned"] += 1
+                else:
+                    summary["gaps"] += 1
+            elif area["status"] == "active":
+                # 已出动：登记改派，接手确认前原船仍负责
+                replacement = pick_replacement(sim_assets, area["kind"], revision["sea_state"],
+                                               impact["new_center"], exclude_asset_ids={original["id"]})
+                disposition = "reassigning" if replacement else "gap"
+                if replacement:
+                    for asset in sim_assets:
+                        if asset["id"] == replacement["id"]:
+                            asset["status"] = "reserved"
+                    summary["reassigning"] += 1
+                else:
+                    summary["gaps"] += 1
+            else:
+                replacement = None
+                disposition = "gap"
+                summary["gaps"] += 1
+            affected.append({
+                "area": area,
+                "original_asset": original,
+                "reasons": impact["reasons"],
+                "new_center": [new_lat, new_lon],
+                "distance_km": impact["distance_km"],
+                "replacement_asset": replacement,
+                "disposition": disposition,
+            })
+        return {"affected": affected, "unaffected": unaffected, "summary": summary}
+
+    def preview_sea_revision(self, actor: str, role: str, revision_id: int) -> dict[str, Any]:
+        """应用前先看受影响区域与重排/缺口结果。"""
+        with self.connect() as conn:
+            revision, incident = self._load_revision_context(conn, revision_id)
+            plan = self._plan_revision(conn, revision, incident)
+            return {"revision": revision, "incident": incident, **plan}
+
+    def _stored_apply_result(self, conn, revision: dict[str, Any]) -> dict[str, Any]:
+        assignments = list_assignments(conn, revision["id"])
+        summary = json.loads(revision["impact_summary"]) if revision["impact_summary"] else {}
+        return {"revision": revision, "summary": summary, "assignments": assignments, "idempotent": True}
+
+    def apply_sea_revision(self, actor: str, role: str, revision_id: int, expected_version: int) -> dict[str, Any]:
+        """确认应用修订。
+
+        - 乐观锁：事件版本与 expected_version 不一致时返回 409，后到的协调员必须刷新重试；
+        - 幂等：已应用的修订重放返回完整结果，不重复改动；
+        - 原子：释放旧安排、占用新资源、登记改派、缺口与落库在同一事务，
+          写入失败整体回滚，重试只会得到完整结果，崩溃后不留半套占用。
+        """
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "应用海况修订")
+        try:
+            expected_version = int(expected_version)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("事件版本必须是数值") from exc
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            revision, incident = self._load_revision_context(conn, revision_id)
+            if revision["status"] == "applied":
+                return self._stored_apply_result(conn, revision)
+            if incident["status"] not in ACTIVE_INCIDENT:
+                raise DomainError("当前事件不能应用海况修订", 409)
+            if incident["version"] != expected_version:
+                raise DomainError("事件已变化，请刷新后重试", 409)
+            # 再次按版本锁定事件行，杜绝并发修订
+            locked = conn.execute(
+                "SELECT id FROM incidents WHERE id=? AND version=?", (incident["id"], expected_version)
+            ).fetchone()
+            if not locked:
+                raise DomainError("事件已变化，请刷新后重试", 409)
+            now = utcnow()
+            conn.execute(
+                "UPDATE incidents SET sea_state=?,drift_direction=?,drift_speed_kn=?,version=version+1,updated_at=? WHERE id=? AND version=?",
+                (revision["sea_state"], revision["drift_direction"], revision["drift_speed_kn"],
+                 now, incident["id"], expected_version),
+            )
+            areas = [dict(r) for r in conn.execute(
+                "SELECT * FROM search_areas WHERE incident_id=? AND status IN ('planned','assigned','active','gap') ORDER BY priority,id",
+                (incident["id"],),
+            ).fetchall()]
+            sim_assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
+            assignments: list[dict[str, Any]] = []
+            summary = {"affected": 0, "reassigned": 0, "reassigning": 0, "gaps": 0, "repositioned": 0}
+            for area in areas:
+                original = next((a for a in sim_assets if a["id"] == area["assigned_asset_id"]), None) if area["assigned_asset_id"] else None
+                if original is None:
+                    new_lat, new_lon = area_drift_center(area, revision["drift_direction"],
+                                                         revision["drift_speed_kn"], revision["effective_at"])
+                    conn.execute(
+                        "UPDATE search_areas SET center_lat=?,center_lon=?,version=version+1,updated_at=? WHERE id=?",
+                        (new_lat, new_lon, now, area["id"]),
+                    )
+                    summary["repositioned"] += 1
+                    continue
+                impact = evaluate_area(area, original, revision["sea_state"], revision["drift_direction"],
+                                       revision["drift_speed_kn"], revision["effective_at"])
+                new_lat, new_lon = impact["new_center"]
+                if not impact["affected"]:
+                    conn.execute(
+                        "UPDATE search_areas SET center_lat=?,center_lon=?,version=version+1,updated_at=? WHERE id=?",
+                        (new_lat, new_lon, now, area["id"]),
+                    )
+                    summary["repositioned"] += 1
+                    continue
+                summary["affected"] += 1
+                reason = ",".join(impact["reasons"])
+                if area["status"] == "assigned":
+                    # 未出动：释放后重排
+                    for asset in sim_assets:
+                        if asset["id"] == original["id"]:
+                            asset["status"] = "available"
+                    conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?",
+                                 (now, original["id"]))
+                    conn.execute(
+                        "UPDATE search_areas SET assigned_asset_id=NULL,status='planned',version=version+1,updated_at=? WHERE id=?",
+                        (now, area["id"]),
+                    )
+                    replacement = pick_replacement(sim_assets, area["kind"], revision["sea_state"],
+                                                   impact["new_center"], exclude_asset_ids=set())
+                    if replacement is None:
+                        conn.execute(
+                            "UPDATE search_areas SET status='gap',assigned_asset_id=NULL,center_lat=?,center_lon=?,version=version+1,updated_at=? WHERE id=?",
+                            (new_lat, new_lon, now, area["id"]),
+                        )
+                        row = insert_assignment(
+                            conn, revision_id=revision["id"], area_id=area["id"],
+                            original_asset_id=original["id"], replacement_asset_id=None,
+                            new_center_lat=new_lat, new_center_lon=new_lon, reason=reason,
+                            status="gap", now=now,
+                        )
+                        summary["gaps"] += 1
+                        self._audit(conn, incident["id"], actor, "sea_revision.gap",
+                                    {"revision_id": revision["id"], "area_id": area["id"], "original_asset_id": original["id"]})
+                    else:
+                        for asset in sim_assets:
+                            if asset["id"] == replacement["id"]:
+                                asset["status"] = "assigned"
+                        conn.execute("UPDATE assets SET status='assigned',version=version+1,updated_at=? WHERE id=?",
+                                     (now, replacement["id"]))
+                        conn.execute(
+                            "UPDATE search_areas SET assigned_asset_id=?,status='assigned',center_lat=?,center_lon=?,version=version+1,updated_at=? WHERE id=?",
+                            (replacement["id"], new_lat, new_lon, now, area["id"]),
+                        )
+                        row = insert_assignment(
+                            conn, revision_id=revision["id"], area_id=area["id"],
+                            original_asset_id=original["id"], replacement_asset_id=replacement["id"],
+                            new_center_lat=new_lat, new_center_lon=new_lon, reason=reason,
+                            status="reassigned", now=now,
+                        )
+                        summary["reassigned"] += 1
+                        self._audit(conn, incident["id"], actor, "sea_revision.reassigned",
+                                    {"revision_id": revision["id"], "area_id": area["id"],
+                                     "original_asset_id": original["id"], "replacement_asset_id": replacement["id"]})
+                elif area["status"] == "active":
+                    # 已出动：先登记改派，接手确认前原船仍负责
+                    replacement = pick_replacement(sim_assets, area["kind"], revision["sea_state"],
+                                                   impact["new_center"], exclude_asset_ids={original["id"]})
+                    if replacement is None:
+                        conn.execute(
+                            "UPDATE search_areas SET status='gap',assigned_asset_id=NULL,center_lat=?,center_lon=?,version=version+1,updated_at=? WHERE id=?",
+                            (new_lat, new_lon, now, area["id"]),
+                        )
+                        conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?",
+                                     (now, original["id"]))
+                        row = insert_assignment(
+                            conn, revision_id=revision["id"], area_id=area["id"],
+                            original_asset_id=original["id"], replacement_asset_id=None,
+                            new_center_lat=new_lat, new_center_lon=new_lon, reason=reason,
+                            status="gap", now=now,
+                        )
+                        summary["gaps"] += 1
+                        self._audit(conn, incident["id"], actor, "sea_revision.gap",
+                                    {"revision_id": revision["id"], "area_id": area["id"], "original_asset_id": original["id"]})
+                    else:
+                        for asset in sim_assets:
+                            if asset["id"] == replacement["id"]:
+                                asset["status"] = "reserved"
+                        conn.execute("UPDATE assets SET status='reserved',version=version+1,updated_at=? WHERE id=?",
+                                     (now, replacement["id"]))
+                        conn.execute(
+                            "UPDATE search_areas SET center_lat=?,center_lon=?,version=version+1,updated_at=? WHERE id=?",
+                            (new_lat, new_lon, now, area["id"]),
+                        )
+                        row = insert_assignment(
+                            conn, revision_id=revision["id"], area_id=area["id"],
+                            original_asset_id=original["id"], replacement_asset_id=replacement["id"],
+                            new_center_lat=new_lat, new_center_lon=new_lon, reason=reason,
+                            status="reassigning", now=now,
+                        )
+                        summary["reassigning"] += 1
+                        self._audit(conn, incident["id"], actor, "sea_revision.reassigning",
+                                    {"revision_id": revision["id"], "area_id": area["id"],
+                                     "original_asset_id": original["id"], "replacement_asset_id": replacement["id"]})
+                else:
+                    # planned/gap 且无资源：仅更新漂移中心
+                    conn.execute(
+                        "UPDATE search_areas SET center_lat=?,center_lon=?,version=version+1,updated_at=? WHERE id=?",
+                        (new_lat, new_lon, now, area["id"]),
+                    )
+                    row = None
+                if row is not None:
+                    assignments.append(row)
+            conn.execute(
+                "UPDATE sea_condition_revisions SET status='applied',applied_at=?,impact_summary=?,version=version+1 WHERE id=?",
+                (now, json_dump(summary), revision["id"]),
+            )
+            self._audit(conn, incident["id"], actor, "sea_revision.applied",
+                        {"revision_id": revision["id"], "summary": summary})
+            applied = get_revision(conn, revision["id"])
+            return {"revision": applied, "summary": summary, "assignments": assignments, "idempotent": False}
+
+    def confirm_revision_handover(self, actor: str, role: str, assignment_id: int) -> dict[str, Any]:
+        """接手船确认接手：原船解除责任，区域改由接手船负责。此前原船仍负责。"""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator", "field"}, "接手确认")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            assignment = get_assignment(conn, assignment_id)
+            if not assignment:
+                raise DomainError("改派记录不存在", 404)
+            if assignment["status"] != "reassigning":
+                raise DomainError("该改派记录不是待接手状态", 409)
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (assignment["area_id"],)).fetchone()
+            if not area:
+                raise DomainError("搜索区域不存在", 404)
+            replacement = conn.execute("SELECT * FROM assets WHERE id=?", (assignment["replacement_asset_id"],)).fetchone()
+            if not replacement or replacement["status"] != "reserved":
+                raise DomainError("接手资源当前不可用，请重新登记改派", 409)
+            now = utcnow()
+            conn.execute(
+                "UPDATE search_areas SET assigned_asset_id=?,version=version+1,updated_at=? WHERE id=?",
+                (replacement["id"], now, area["id"]),
+            )
+            conn.execute("UPDATE assets SET status='assigned',version=version+1,updated_at=? WHERE id=?",
+                         (now, replacement["id"]))
+            conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?",
+                         (now, assignment["original_asset_id"]))
+            conn.execute(
+                "UPDATE revision_assignments SET status='handed_over',confirmed_by=?,confirmed_at=?,updated_at=? WHERE id=?",
+                (actor, now, now, assignment_id),
+            )
+            self._audit(conn, area["incident_id"], actor, "sea_revision.handover_confirmed",
+                        {"assignment_id": assignment_id, "area_id": area["id"],
+                         "original_asset_id": assignment["original_asset_id"],
+                         "replacement_asset_id": replacement["id"]})
+            return get_assignment(conn, assignment_id)
+
+    def list_sea_revisions(self, incident_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return list_revisions(conn, incident_id)
+
+    def list_revision_assignments(self, revision_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            revision = get_revision(conn, revision_id)
+            if not revision:
+                raise DomainError("海况修订不存在", 404)
+            return {"revision": revision, "assignments": list_assignments(conn, revision_id)}
+
     def merge_offline_batch(self, actor: str, role: str, client_batch_id: str,
                             events: list[dict[str, Any]]) -> dict[str, Any]:
         actor = clean_actor(actor)
@@ -625,6 +1002,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 incident_id = int(path.split("/")[3])
                 self._send(200, {"timeline": self.service.incident_timeline(incident_id)})
                 return
+            if path.startswith("/api/incidents/") and path.endswith("/sea-revisions"):
+                incident_id = int(path.split("/")[3])
+                self._send(200, {"revisions": self.service.list_sea_revisions(incident_id)})
+                return
+            if path.startswith("/api/sea-revisions/") and path.endswith("/assignments"):
+                revision_id = int(path.split("/")[3])
+                self._send(200, self.service.list_revision_assignments(revision_id))
+                return
+            if path.startswith("/api/sea-revisions/"):
+                revision_id = int(path.split("/")[3])
+                self._send(200, self.service.preview_sea_revision(*self._actor(), revision_id))
+                return
             self._send(404, {"error": "接口不存在"})
         except (DomainError, ValueError) as exc:
             self._send(getattr(exc, "status", 400), {"error": str(exc)})
@@ -655,6 +1044,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.close_incident(actor, role, **data)
             elif path == "/api/offline/batch":
                 result = self.service.merge_offline_batch(actor, role, **data)
+            elif path == "/api/areas/activate":
+                result = self.service.activate_area(actor, role, **data)
+            elif path == "/api/sea-revisions":
+                result = self.service.register_sea_revision(actor, role, **data)
+            elif path.startswith("/api/sea-revisions/") and path.endswith("/apply"):
+                revision_id = int(path.split("/")[3])
+                result = self.service.apply_sea_revision(actor, role, revision_id, **data)
+            elif path.startswith("/api/revision-assignments/") and path.endswith("/confirm"):
+                assignment_id = int(path.split("/")[3])
+                result = self.service.confirm_revision_handover(actor, role, assignment_id)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
