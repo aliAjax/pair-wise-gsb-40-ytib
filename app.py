@@ -3,50 +3,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sqlite3
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from revision.common import DomainError, clean_actor, json_dump, require_role, utcnow
+from revision.geo import haversine_km
+from revision.models import ACTIVE_INCIDENT_STATUSES, CLOSED_INCIDENT_STATUSES
+from revision.service import RevisionService
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "maritime_sar.db"
-ACTIVE_INCIDENT = {"reported", "coordinating", "recovering"}
-CLOSED_INCIDENT = {"closed", "cancelled", "duplicate"}
-
-
-class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
-        super().__init__(message)
-        self.status = status
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius = 6371.0088
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * radius * math.asin(math.sqrt(a))
-
-
-def require_role(role: str, allowed: set[str], action: str) -> None:
-    if role not in allowed:
-        raise DomainError("角色无权执行：%s" % action, 403)
-
-
-def clean_actor(actor: str) -> str:
-    actor = (actor or "").strip()
-    if not actor:
-        raise DomainError("缺少操作人")
-    return actor
+ACTIVE_INCIDENT = ACTIVE_INCIDENT_STATUSES
+CLOSED_INCIDENT = CLOSED_INCIDENT_STATUSES
 
 
 def validate_position(lat: Any, lon: Any) -> tuple[float, float]:
@@ -59,14 +31,11 @@ def validate_position(lat: Any, lon: Any) -> tuple[float, float]:
     return lat, lon
 
 
-def json_dump(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
 class MaritimeSARService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
         self._init_schema()
+        self.revisions = RevisionService(self.db_path)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -94,6 +63,7 @@ class MaritimeSARService:
                     lead_org TEXT NOT NULL,
                     duplicate_of INTEGER REFERENCES incidents(id),
                     version INTEGER NOT NULL DEFAULT 1,
+                    plan_version INTEGER NOT NULL DEFAULT 1,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -330,6 +300,20 @@ class MaritimeSARService:
             self._audit(conn, area["incident_id"], actor, "area.assigned", {"area_id": area_id, "asset_id": asset_id, "distance_km": round(distance, 2)})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
 
+    def depart_area(self, actor: str, role: str, area_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator", "operator"}, "登记出动")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+            if not area:
+                raise DomainError("搜索区域不存在", 404)
+            if area["status"] != "assigned" or area["assigned_asset_id"] is None:
+                raise DomainError("区域未分配资源，不能登记出动", 409)
+            conn.execute("UPDATE search_areas SET status='active',version=version+1,updated_at=? WHERE id=?", (utcnow(), area_id))
+            self._audit(conn, area["incident_id"], actor, "area.departed", {"area_id": area_id, "asset_id": area["assigned_asset_id"]})
+            return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
+
     def record_clue(self, actor: str, role: str, incident_id: int, client_event_id: str,
                     latitude: float, longitude: float, confidence: float, source: str,
                     area_id: int | None = None, details: str = "") -> dict[str, Any]:
@@ -402,6 +386,12 @@ class MaritimeSARService:
                 raise DomainError("资源状态已变化，请刷新后重试", 409)
             if asset["status"] == "available":
                 raise DomainError("资源当前未分配", 409)
+            pending = conn.execute(
+                "SELECT COUNT(*) AS c FROM reassignments WHERE replacement_asset_id=? AND status='pending_takeover'",
+                (asset_id,),
+            ).fetchone()["c"]
+            if pending:
+                raise DomainError("资源存在待确认的改派，不能撤回", 409)
             now = utcnow()
             areas = conn.execute("SELECT id,incident_id FROM search_areas WHERE assigned_asset_id=? AND status IN ('assigned','active')", (asset_id,)).fetchall()
             for area in areas:
@@ -625,6 +615,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 incident_id = int(path.split("/")[3])
                 self._send(200, {"timeline": self.service.incident_timeline(incident_id)})
                 return
+            if path == "/api/revisions":
+                query = parse_qs(urlparse(self.path).query)
+                incident_id = int(query["incident_id"][0]) if query.get("incident_id") else None
+                self._send(200, self.service.revisions.view(incident_id))
+                return
+            if path.startswith("/api/revisions/"):
+                revision_id = int(path.split("/")[3])
+                self._send(200, self.service.revisions.preview(revision_id))
+                return
             self._send(404, {"error": "接口不存在"})
         except (DomainError, ValueError) as exc:
             self._send(getattr(exc, "status", 400), {"error": str(exc)})
@@ -649,6 +648,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.withdraw_asset(actor, role, **data)
             elif path == "/api/areas/complete":
                 result = self.service.complete_area(actor, role, **data)
+            elif path == "/api/areas/depart":
+                result = self.service.depart_area(actor, role, **data)
+            elif path == "/api/revisions":
+                result = self.service.revisions.register(actor, role, **data)
+            elif path == "/api/revisions/confirm":
+                result = self.service.revisions.confirm(actor, role, **data)
+            elif path == "/api/reassignments/confirm":
+                result = self.service.revisions.confirm_takeover(actor, role, **data)
             elif path == "/api/incidents/transfer":
                 result = self.service.transfer_incident(actor, role, **data)
             elif path == "/api/incidents/close":
